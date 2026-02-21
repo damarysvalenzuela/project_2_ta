@@ -1,128 +1,149 @@
+"""
+backtest.py
+===========
+Motor de backtesting realista para estrategia Long/Short sin apalancamiento.
+
+REGLAS DE MARGEN (shorts):
+    INIT_MARGIN  = 50%  → Broker bloquea 50% del nocional como garantía.
+                          Ej: short $10,000 en BTC → $5,000 bloqueados.
+    MAINT_MARGIN = 30%  → Margin call si equity_posición / valor_mercado < 30%.
+    BORROW_RATE  = 1%/año → Interés sobre el nocional prestado, por barra 5min.
+                          = 0.01 / 105,120 barras/año
+
+COMISIÓN:
+    COM = 0.125% aplicado al nocional en apertura y cierre de cada posición.
+
+"""
+
 import pandas as pd
-import ta
+from indicators import get_signals
+
+# Constantes globales
+COM          = 0.125 / 100
+INIT_MARGIN  = 0.50
+MAINT_MARGIN = 0.30
+BORROW_RATE  = 0.01 / (365 * 24 * 12)   # 1% anual → por barra de 5min
 
 
-def run_single_backtest(data: pd.DataFrame) -> list[float]:
-    """ Backtest a simple RSI strategy
-    """
-    data = data.copy()
+def run_single_backtest(
+    data: pd.DataFrame,
+    params: dict
+) -> tuple[pd.Series, list]:
 
-    # params & constants
-    cash = 1_000_000
-    COM = 0.125 / 100
-    active_long_positions = []
-    active_short_positions = []
-    strategy_value = [cash]
+    cash           = 1_000_000.0
+    active_pos     = None
+    equity_hist    = []
+    trades_history = []
 
-    num_operations = 0
+    data_records = data.to_dict("records")
 
-    # hyperparams
-    rsi_window = 4
-    rsi_lower = 41
-    # rsi_upper = 70
+    for row in data_records:
+        price = row["Close"]
 
-    n_shares = 2
-    take_profit = 0.135
-    stop_loss = 0.142
+        # ── 1. GESTIÓN DE POSICIÓN ACTIVA ─────────────────────────── #
+        if active_pos is not None:
 
-    rsi_ind = ta.momentum.RSIIndicator(data.Close, window=rsi_window)
+            if active_pos["side"] == "LONG":
+                pnl      = (price - active_pos["entry"]) * active_pos["shares"]
+                is_exit  = (price <= active_pos["sl"]) or (price >= active_pos["tp"])
 
-    # Store indicators in the dataframe
-    data["rsi"] = rsi_ind.rsi()
+            else:  # SHORT
+                # Cobrar borrow cada barra sobre el nocional al precio de entrada
+                borrow_cost = (active_pos["shares"] * active_pos["entry"]) * BORROW_RATE
+                active_pos["accumulated_borrow"] += borrow_cost
 
-    data = data.dropna()
+                pnl = (
+                    (active_pos["entry"] - price) * active_pos["shares"]
+                    - active_pos["accumulated_borrow"]
+                )
 
-    for i, row in data.iterrows():
+                # Margin call: equity_posición / valor_mercado < 30%
+                equity_in_pos = active_pos["margin_locked"] + pnl
+                valor_mercado = price * active_pos["shares"]
+                margin_level  = (
+                    equity_in_pos / valor_mercado if valor_mercado > 0 else 1.0
+                )
 
-        # Risk Management
-        for position in active_long_positions.copy():
-            current_val = row.Close * n_shares
-            if current_val < position["sl"] or current_val > position["tp"]:
-                # Close position
-                cash += current_val * (1 - COM)
-                active_long_positions.remove(position)
+                is_exit = (
+                    (price >= active_pos["sl"])
+                    or (price <= active_pos["tp"])
+                    or (margin_level <= MAINT_MARGIN)
+                )
 
-        # Check if rsi < rsi_lower
-        if row.rsi < rsi_lower:  # Long signal
-            cost = row.Close * n_shares * (1 + COM)
-            if cash > cost:
-                cash -= cost
-                active_long_positions.append({
-                    "bought_at": row.Close,
-                    "type": "LONG",
-                    "sl": row.Close * n_shares * (1 - stop_loss),
-                    "tp": row.Close * n_shares * (1 + take_profit),
-                    "shares": n_shares
+            # ── Cerrar posición ────────────────────────────────────── #
+            if is_exit:
+                fee = price * active_pos["shares"] * COM
+
+                if active_pos["side"] == "LONG":
+                    cash   += price * active_pos["shares"] - fee
+                    net_pnl = pnl - fee
+                else:
+                    # Devolver margen bloqueado + PnL - comisión de cierre
+                    cash   += active_pos["margin_locked"] + pnl - fee
+                    net_pnl = pnl - fee
+
+                trades_history.append({
+                    "pnl":  net_pnl,
+                    "side": active_pos["side"]
                 })
-                num_operations += 1
+                active_pos = None
 
-        # Strategy Value
-        long_values = len(active_long_positions) * row.Close * n_shares
-        current_strategy_value = cash + long_values
-        strategy_value.append(current_strategy_value)
+        # ── 2. APERTURA DE NUEVA POSICIÓN ─────────────────────────── #
+        if active_pos is None:
+            sig = get_signals(row, params)
 
-    # Returns...
-    return strategy_value, num_operations
+            if sig != 0:
+                # Sizing: 1% de riesgo sobre el capital actual
+                n_shares_ideal = (cash * 0.01) / (price * params["stop_loss"])
+                # Techo: nocional ≤ 98% del cash (sin apalancamiento)
+                max_shares     = (cash * 0.98) / (price * (1 + COM))
+                n_shares       = min(n_shares_ideal, max_shares)
 
-def objective(data: pd.DataFrame, trial) -> list[float]:
-    """ Backtest a simple RSI strategy
-    """
-    data = data.copy()
+                if n_shares > 0.0001:
+                    notional = price * n_shares
+                    fee      = notional * COM
 
-    # params & constants
-    cash = 1_000_000
-    COM = 0.125 / 100
-    active_long_positions = []
-    active_short_positions = []
-    strategy_value = [cash]
+                    if sig == 1:  # LONG
+                        cost = notional + fee
+                        if cash >= cost:
+                            cash -= cost
+                            active_pos = {
+                                "side":   "LONG",
+                                "entry":  price,
+                                "shares": n_shares,
+                                "sl":     price * (1 - params["stop_loss"]),
+                                "tp":     price * (1 + params["take_profit"]),
+                            }
 
-    num_operations = 0
+                    else:  # SHORT
+                        margin_req = notional * INIT_MARGIN
+                        cost_short = margin_req + fee
+                        # CRÍTICO: verificar cash antes de abrir short
+                        if cash >= cost_short:
+                            cash -= cost_short
+                            active_pos = {
+                                "side":               "SHORT",
+                                "entry":              price,
+                                "shares":             n_shares,
+                                "margin_locked":      margin_req,
+                                "accumulated_borrow": 0.0,
+                                "sl":  price * (1 + params["stop_loss"]),
+                                "tp":  price * (1 - params["take_profit"]),
+                            }
 
-    # hyperparams
-    rsi_window = trial.suggest_int("rsi_window", 4, 40)
-    rsi_lower = trial.suggest_int("rsi_lower", 5, 45)
-    # rsi_upper = 70
+        # ── 3. MARK-TO-MARKET ─────────────────────────────────────── #
+        current_val = cash
 
-    n_shares = trial.suggest_int("n_shares", 0.1, 10)
-    take_profit = trial.suggest_float("take_profit", 0.02, 0.15)
-    stop_loss = trial.suggest_float("stop_loss", 0.02, 0.15)
+        if active_pos is not None:
+            if active_pos["side"] == "LONG":
+                current_val += price * active_pos["shares"]
+            else:
+                pnl_mtm = (
+                    (active_pos["entry"] - price) * active_pos["shares"]
+                    - active_pos.get("accumulated_borrow", 0.0)
+                )
+                current_val += active_pos["margin_locked"] + pnl_mtm
 
-    rsi_ind = ta.momentum.RSIIndicator(data.Close, window=rsi_window)
+        equity_hist.append(current_val)
 
-    # Store indicators in the dataframe
-    data["rsi"] = rsi_ind.rsi()
-
-    data = data.dropna()
-
-    for i, row in data.iterrows():
-
-        # Risk Management
-        for position in active_long_positions.copy():
-            current_val = row.Close * n_shares
-            if current_val < position["sl"] or current_val > position["tp"]:
-                # Close position
-                cash += current_val * (1 - COM)
-                active_long_positions.remove(position)
-
-        # Check if rsi < rsi_lower
-        if row.rsi < rsi_lower:  # Long signal
-            cost = row.Close * n_shares * (1 + COM)
-            if cash > cost:
-                cash -= cost
-                active_long_positions.append({
-                    "bought_at": row.Close,
-                    "type": "LONG",
-                    "sl": row.Close * n_shares * (1 - stop_loss),
-                    "tp": row.Close * n_shares * (1 + take_profit),
-                    "shares": n_shares
-                })
-                num_operations += 1
-
-        # Strategy Value
-        long_values = len(active_long_positions) * row.Close * n_shares
-        current_strategy_value = cash + long_values
-        strategy_value.append(current_strategy_value)
-
-    # Returns...
-    ret = strategy_value[-1] / strategy_value[0] - 1
-    return ret
+    return pd.Series(equity_hist, index=data.index), trades_history
