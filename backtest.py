@@ -1,68 +1,79 @@
 """
-backtest.py
-===========
-Motor de backtesting realista para estrategia Long/Short sin apalancamiento.
+backtest.py — Long/Short backtesting engine without leverage.
 
-REGLAS DE MARGEN (shorts):
-    INIT_MARGIN  = 50%  → Broker bloquea 50% del nocional como garantía.
-                          Ej: short $10,000 en BTC → $5,000 bloqueados.
-    MAINT_MARGIN = 30%  → Margin call si equity_posición / valor_mercado < 30%.
-    BORROW_RATE  = 1%/año → Interés sobre el nocional prestado, por barra 5min.
-                          = 0.01 / 105,120 barras/año
-
-COMISIÓN:
-    COM = 0.125% aplicado al nocional en apertura y cierre de cada posición.
-
+Rules:
+  • Commission : 0.125 % per side
+  • LONG       : pay full notional + fee; no leverage
+  • SHORT      : require cash ≥ notional + fee (conservative); lock
+                 50 % as initial margin; 30 % maintenance margin;
+                 borrow cost 1 %/year pro-rated per 5-min bar
+  • Position sizing by risk: size = (cash × risk_per_trade) / (price × sl_pct)
+    capped at 98 % of available cash
 """
 
 import pandas as pd
-from indicators import get_signals
 
-# Constantes globales
-COM          = 0.125 / 100
+COM          = 0.00125          # 0.125 %
 INIT_MARGIN  = 0.50
 MAINT_MARGIN = 0.30
-BORROW_RATE  = 0.01 / (365 * 24 * 12)   # 1% anual → por barra de 5min
+BORROW_RATE  = 0.01 / (365 * 24 * 12)  # 1 % p.a. ÷ 5-min bars per year
 
 
 def run_single_backtest(
     data: pd.DataFrame,
-    params: dict
+    params: dict,
 ) -> tuple[pd.Series, list]:
+    """
+    Run one complete backtest on a pre-processed & indicator-enriched DataFrame.
+
+    Parameters
+    ----------
+    data   : DataFrame with Close column and all indicator columns.
+    params : dict of strategy parameters (stop_loss, take_profit,
+             risk_per_trade, …).
+
+    Returns
+    -------
+    equity_series : pd.Series of mark-to-market portfolio value.
+    trades_history: list of dicts with keys 'pnl' and 'side'.
+    """
+    from indicators import get_signals
 
     cash           = 1_000_000.0
     active_pos     = None
     equity_hist    = []
     trades_history = []
 
-    data_records = data.to_dict("records")
+    sl_pct = float(params["stop_loss"])
+    tp_pct = float(params["take_profit"])
+    risk   = float(params.get("risk_per_trade", 0.002))
 
-    for row in data_records:
-        price = row["Close"]
+    for row in data.to_dict("records"):
+        price = float(row["Close"])
 
-        # ── 1. GESTIÓN DE POSICIÓN ACTIVA ─────────────────────────── #
+        # ──────────────────────────────────────────────────────────────
+        # 1. Manage open position
+        # ──────────────────────────────────────────────────────────────
         if active_pos is not None:
+            side = active_pos["side"]
 
-            if active_pos["side"] == "LONG":
-                pnl      = (price - active_pos["entry"]) * active_pos["shares"]
-                is_exit  = (price <= active_pos["sl"]) or (price >= active_pos["tp"])
+            if side == "LONG":
+                pnl     = (price - active_pos["entry"]) * active_pos["shares"]
+                is_exit = (price <= active_pos["sl"]) or (price >= active_pos["tp"])
 
             else:  # SHORT
-                # Cobrar borrow cada barra sobre el nocional al precio de entrada
-                borrow_cost = (active_pos["shares"] * active_pos["entry"]) * BORROW_RATE
+                # Accrue borrow cost in USDT
+                borrow_cost = active_pos["shares"] * BORROW_RATE * price
                 active_pos["accumulated_borrow"] += borrow_cost
 
-                pnl = (
-                    (active_pos["entry"] - price) * active_pos["shares"]
-                    - active_pos["accumulated_borrow"]
-                )
+                pnl = ((active_pos["entry"] - price) * active_pos["shares"]
+                       - active_pos["accumulated_borrow"])
 
-                # Margin call: equity_posición / valor_mercado < 30%
+                # Maintenance margin check
                 equity_in_pos = active_pos["margin_locked"] + pnl
-                valor_mercado = price * active_pos["shares"]
-                margin_level  = (
-                    equity_in_pos / valor_mercado if valor_mercado > 0 else 1.0
-                )
+                notional_now  = price * active_pos["shares"]
+                margin_level  = (equity_in_pos / notional_now
+                                 if notional_now > 0 else 1.0)
 
                 is_exit = (
                     (price >= active_pos["sl"])
@@ -70,78 +81,73 @@ def run_single_backtest(
                     or (margin_level <= MAINT_MARGIN)
                 )
 
-            # ── Cerrar posición ────────────────────────────────────── #
+            # Close position
             if is_exit:
-                fee = price * active_pos["shares"] * COM
+                fee_exit = price * active_pos["shares"] * COM
 
-                if active_pos["side"] == "LONG":
-                    cash   += price * active_pos["shares"] - fee
-                    net_pnl = pnl - fee
+                if side == "LONG":
+                    cash   += price * active_pos["shares"] - fee_exit
+                    net_pnl = pnl - fee_exit
                 else:
-                    # Devolver margen bloqueado + PnL - comisión de cierre
-                    cash   += active_pos["margin_locked"] + pnl - fee
-                    net_pnl = pnl - fee
+                    cash   += active_pos["margin_locked"] + pnl - fee_exit
+                    net_pnl = pnl - fee_exit
 
-                trades_history.append({
-                    "pnl":  net_pnl,
-                    "side": active_pos["side"]
-                })
+                trades_history.append({"pnl": net_pnl, "side": side})
                 active_pos = None
 
-        # ── 2. APERTURA DE NUEVA POSICIÓN ─────────────────────────── #
+        # ──────────────────────────────────────────────────────────────
+        # 2. Open new position
+        # ──────────────────────────────────────────────────────────────
         if active_pos is None:
             sig = get_signals(row, params)
 
             if sig != 0:
-                # Sizing: 1% de riesgo sobre el capital actual
-                n_shares_ideal = (cash * 0.01) / (price * params["stop_loss"])
-                # Techo: nocional ≤ 98% del cash (sin apalancamiento)
+                # Size by risk; cap at 98 % of cash
+                n_shares_ideal = (cash * risk) / (price * sl_pct)
                 max_shares     = (cash * 0.98) / (price * (1 + COM))
                 n_shares       = min(n_shares_ideal, max_shares)
 
                 if n_shares > 0.0001:
-                    notional = price * n_shares
-                    fee      = notional * COM
+                    notional  = price * n_shares
+                    fee_entry = notional * COM
 
                     if sig == 1:  # LONG
-                        cost = notional + fee
+                        cost = notional + fee_entry
                         if cash >= cost:
                             cash -= cost
                             active_pos = {
-                                "side":   "LONG",
-                                "entry":  price,
+                                "side":  "LONG",
+                                "entry": price,
                                 "shares": n_shares,
-                                "sl":     price * (1 - params["stop_loss"]),
-                                "tp":     price * (1 + params["take_profit"]),
+                                "sl": price * (1 - sl_pct),
+                                "tp": price * (1 + tp_pct),
                             }
 
-                    else:  # SHORT
-                        margin_req = notional * INIT_MARGIN
-                        cost_short = margin_req + fee
-                        # CRÍTICO: verificar cash antes de abrir short
-                        if cash >= cost_short:
-                            cash -= cost_short
+                    else:  # SHORT — require full notional in cash (no leverage)
+                        if cash >= notional + fee_entry:
+                            margin_req = notional * INIT_MARGIN
+                            cash -= margin_req + fee_entry
                             active_pos = {
-                                "side":               "SHORT",
-                                "entry":              price,
-                                "shares":             n_shares,
-                                "margin_locked":      margin_req,
+                                "side":  "SHORT",
+                                "entry": price,
+                                "shares": n_shares,
+                                "margin_locked": margin_req,
                                 "accumulated_borrow": 0.0,
-                                "sl":  price * (1 + params["stop_loss"]),
-                                "tp":  price * (1 - params["take_profit"]),
+                                "sl": price * (1 + sl_pct),
+                                "tp": price * (1 - tp_pct),
                             }
 
-        # ── 3. MARK-TO-MARKET ─────────────────────────────────────── #
+        # ──────────────────────────────────────────────────────────────
+        # 3. Mark-to-market equity
+        # ──────────────────────────────────────────────────────────────
         current_val = cash
 
         if active_pos is not None:
             if active_pos["side"] == "LONG":
                 current_val += price * active_pos["shares"]
             else:
-                pnl_mtm = (
-                    (active_pos["entry"] - price) * active_pos["shares"]
-                    - active_pos.get("accumulated_borrow", 0.0)
-                )
+                pnl_mtm = ((active_pos["entry"] - price) * active_pos["shares"]
+                           - active_pos.get("accumulated_borrow", 0.0))
                 current_val += active_pos["margin_locked"] + pnl_mtm
 
         equity_hist.append(current_val)
