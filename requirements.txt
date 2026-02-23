@@ -3,3 +3,4 @@ pandas==2.3.3
 ta
 matplotlib
 numpy
+optuna
