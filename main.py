@@ -23,7 +23,7 @@ print("[DEBUG] FLOAT_PARAMS:", getattr(sa, "FLOAT_PARAMS", None))
 #  CONFIGURACIÓN
 # ─────────────────────────────────────────────────────── #
 
-N_TRIALS          = 100
+N_TRIALS          = 200
 DELTA_SENSITIVITY = 0.20
 
 

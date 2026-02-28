@@ -1,12 +1,12 @@
 [
     {
-        "ema_slow": 151,
-        "rsi_window": 27,
-        "macd_fast": 22,
-        "macd_slow": 51,
-        "macd_sign": 18,
-        "stop_loss": 0.026110669776011355,
-        "take_profit": 0.07509260099809908,
-        "risk_per_trade": 0.011158690595251297
+        "ema_slow": 385,
+        "rsi_window": 16,
+        "macd_fast": 15,
+        "macd_slow": 29,
+        "macd_sign": 12,
+        "stop_loss": 0.03028605209885403,
+        "take_profit": 0.07093272663702227,
+        "risk_per_trade": 0.012917775365989408
     }
 ]
